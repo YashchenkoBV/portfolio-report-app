@@ -1,11 +1,12 @@
-# src/services/extractors/freedom_finance.py
 from __future__ import annotations
 import re
-from datetime import datetime, date
+from datetime import datetime
 from sqlalchemy.orm import Session
 from ...models import SourceFile, Valuation, CashFlowExternal
 from ...utils.pdf import read_text
-from ...services.bootstrap import bootstrap_broker, get_or_create_account, parse_money_to_float, parse_date_iso
+from ...services.bootstrap import (
+    bootstrap_broker, get_or_create_account, parse_money_to_float, parse_date_iso
+)
 from .base import BaseExtractor
 
 PERIOD_RX = re.compile(r"От(ч|чё)т брокера за период.*?(\d{4}-\d{2}-\d{2}).*?-\s*(\d{4}-\d{2}-\d{2})", re.IGNORECASE | re.DOTALL)
@@ -30,7 +31,6 @@ class FreedomFinanceExtractor(BaseExtractor):
         begin_nav = parse_money_to_float(m0.group(0)) if m0 else None
         end_nav   = parse_money_to_float(m1.group(0)) if m1 else None
 
-        # quick-and-robust flows (first pass): look for the keyword lines and grab nearby date+amount
         flows = []
         lines = t.splitlines()
         for i, line in enumerate(lines):
@@ -58,13 +58,16 @@ class FreedomFinanceExtractor(BaseExtractor):
         sm = self.summary(path)
         session.add(SourceFile(broker_id=broker.id, path=path, asof_date=None)); session.commit()
 
+        if sm["period_start"] and sm["begin_nav_usd"] is not None:
+            d0 = datetime.strptime(sm["period_start"], "%Y-%m-%d").date()
+            session.add(Valuation(date=d0, account_id=acc.id, total_value=sm["begin_nav_usd"], method="reported"))
         if sm["period_end"] and sm["end_nav_usd"] is not None:
-            asof = datetime.strptime(sm["period_end"], "%Y-%m-%d").date()
-            session.add(Valuation(date=asof, account_id=acc.id, total_value=sm["end_nav_usd"], method="reported")); session.commit()
+            d1 = datetime.strptime(sm["period_end"], "%Y-%m-%d").date()
+            session.add(Valuation(date=d1, account_id=acc.id, total_value=sm["end_nav_usd"], method="reported"))
+        session.commit()
 
-        if sm["flows"]:
-            for f in sm["flows"]:
-                dt = datetime.strptime(f["date"], "%Y-%m-%d").date()
-                session.add(CashFlowExternal(date=dt, account_id=acc.id, amount=f["amount"], note=f["type"]))
-            session.commit()
+        for f in sm["flows"]:
+            dt = datetime.strptime(f["date"], "%Y-%m-%d").date()
+            session.add(CashFlowExternal(date=dt, account_id=acc.id, amount=f["amount"], note=f["type"]))
+        session.commit()
         return sm
