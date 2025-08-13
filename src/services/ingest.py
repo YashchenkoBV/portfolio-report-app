@@ -1,7 +1,5 @@
 from __future__ import annotations
-from pathlib import Path
 from sqlalchemy.orm import Session
-from ..models import Base, Broker, SourceFile
 from ..utils.pdf import read_text
 from ..extractors.ubs import UBSExtractor
 from ..extractors.raymond_james import RaymondJamesExtractor
@@ -21,11 +19,3 @@ def ingest_file(session: Session, path: str):
     if not ex:
         raise ValueError(f"No extractor matched: {path}")
     return ex.parse(session, path)
-
-def bootstrap_broker(session: Session, name: str) -> Broker:
-    b = session.query(Broker).filter_by(name=name).first()
-    if not b:
-        b = Broker(name=name)
-        session.add(b)
-        session.commit()
-    return b

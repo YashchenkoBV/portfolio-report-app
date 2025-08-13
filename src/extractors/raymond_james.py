@@ -1,45 +1,45 @@
 from __future__ import annotations
+import re
 from datetime import datetime
 from sqlalchemy.orm import Session
-from ..models import Broker, Account, SourceFile, Valuation
-from ..services.ingest import bootstrap_broker
+from ..models import SourceFile, Valuation
+from ..utils.pdf import read_text_all
+from ..services.bootstrap import bootstrap_broker, get_or_create_account, parse_money_to_float
 from .base import BaseExtractor
-from ..utils.pdf import read_text
+
+ASOF_RX = re.compile(r"As of\s+(\d{2}/\d{2}/\d{4})", re.IGNORECASE)
 
 class RaymondJamesExtractor(BaseExtractor):
     name = "Raymond James"
 
     def detect(self, lower_text: str) -> bool:
-        return "raymond james | client access | my accounts | portfolio" in lower_text or "raymond james" in lower_text
+        return "raymond james | client access | my accounts | portfolio" in lower_text or "current value" in lower_text
 
     def parse(self, session: Session, path: str):
         broker = bootstrap_broker(session, self.name)
-        text = read_text(path, max_pages=2)
+        acc = get_or_create_account(session, broker.id, "RJ Consolidated", "USD")
+
+        text = read_text_all(path)
         asof = None
         for line in text.splitlines():
             if "as of" in line.lower():
-                asof = line.split("as of",1)[1].strip().split()[0:3]
-                asof = " ".join(asof)
+                # Raymond James prints US format “As of 07/23/2025”
+                dt = line.split("As of", 1)[1].strip().split()[0]
                 try:
-                    asof = datetime.strptime(asof.replace(",", ""), "%B %d %Y").date()
-                except: 
+                    asof = datetime.strptime(dt, "%m/%d/%Y").date()
+                except:
                     asof = None
                 break
-        acc = session.query(Account).filter_by(broker_id=broker.id, name="RJ Consolidated").first()
-        if not acc:
-            acc = Account(broker_id=broker.id, name="RJ Consolidated", base_currency="USD")
-            session.add(acc); session.commit()
-        sf = SourceFile(broker_id=broker.id, path=path, asof_date=asof)
-        session.add(sf); session.commit()
+
         total = None
         for line in text.splitlines():
-            if "current value" in line.lower() and "$" in line:
-                digits = "".join(ch for ch in line if ch.isdigit() or ch in ".")
-                try:
-                    total = float(digits)
-                except: 
-                    total = None
-                break
+            if "current value" in line.lower():
+                val = parse_money_to_float(line)
+                if val:
+                    total = val
+        sf = SourceFile(broker_id=broker.id, path=path, asof_date=asof)
+        session.add(sf); session.commit()
+
         if total:
             session.add(Valuation(date=asof or datetime.today().date(), account_id=acc.id, total_value=total, method="reported"))
             session.commit()
