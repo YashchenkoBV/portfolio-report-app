@@ -1,130 +1,93 @@
+"""Flask application entry point for the portfolio report app.
+
+This application automatically scans the ``data`` directory for PDF files
+on startup, parses them using the available extractors, stores the
+results in a SQLite database and computes simple portfolio metrics. The
+home page displays a summary of the ingestion status and the computed
+metrics. A ``/reingest`` route is available to re‑scan the data folder
+manually.
+
+The UI is deliberately minimal: no file upload, only the data in the
+``data`` directory is considered. If no PDFs are present or parsing
+fails, the metrics tables will be empty.
+"""
+
 from __future__ import annotations
-import os, json, threading
-from flask import Flask, jsonify, render_template_string
+
+import os
+import threading
+from datetime import datetime
+from flask import Flask, jsonify, render_template_string, redirect, url_for
 from .db import init_db
-from .models import Base, Valuation, CashFlowExternal
+from .models import Base, CashFlowExternal
 from .services.ingest import ingest_all, detect_extractor
 from .services.holdings import consolidated_nav, latest_valuations
 from .services.kpis import xirr
 
-INDEX_HTML = """
-<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <title>Portfolio App</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <style>
-    * { box-sizing: border-box; }
-    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 24px; color:#222; }
-    h1 { margin: 0 0 8px; }
-    .sub { color:#666; margin-bottom:16px; }
-    .row { display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin-bottom:10px; }
-    button { padding:9px 12px; border:1px solid #d0d0d0; border-radius:10px; background:#fff; cursor:pointer; }
-    button:hover { background:#f6f6f6; }
-    .pill { padding:6px 10px; border:1px solid #eee; border-radius:999px; background:#fafafa; }
-    .card { border:1px solid #eee; padding:12px; border-radius:12px; margin-top:12px; }
-    pre { white-space: pre-wrap; word-break: break-word; background:#fcfcfc; border:1px solid #f0f0f0; padding:10px; border-radius:8px; }
-    .ok{color:#2a7;}
-    .warn{color:#c80;}
-    .err{color:#c22;}
-  </style>
-</head>
-<body>
-  <h1>Portfolio App</h1>
-  <div class="sub">Works only with PDFs in <b>data/</b>. Ingestion runs automatically on server start.</div>
 
-  <div class="row">
-    <span class="pill" id="ingest-pill">Ingestion: pending…</span>
-    <button onclick="call('GET','/api/ingest_report')">Ingest Report</button>
-    <button onclick="call('GET','/api/parsed_main')">Parsed Main</button>
-    <button onclick="call('GET','/api/dashboard')">Dashboard</button>
-    <button onclick="call('GET','/api/kpi')">KPI</button>
-    <button onclick="call('POST','/api/reingest')">Re-scan data/</button>
-  </div>
-
-  <div class="card">
-    <div id="status">Ready.</div>
-    <pre id="out"></pre>
-  </div>
-
-<script>
-async function call(method, url) {
-  setStatus(method + " " + url + " …");
-  try {
-    const res = await fetch(url, { method });
-    const txt = await res.text();
-    let body = txt;
-    try { body = JSON.parse(txt); } catch {}
-    setStatus(method + " " + url + " → " + res.status);
-    show(body);
-  } catch (e) {
-    setStatus("Error: " + e);
-  }
-}
-function setStatus(s){ document.getElementById('status').textContent = s; }
-function show(obj){ 
-  const pre = document.getElementById('out'); 
-  pre.textContent = (typeof obj === 'string') ? obj : JSON.stringify(obj, null, 2);
-}
-// initial poll of ingest status
-async function pollIngest() {
-  try{
-    const res = await fetch('/api/ingest_report');
-    const data = await res.json();
-    const pill = document.getElementById('ingest-pill');
-    if (Array.isArray(data)) {
-      const ok = data.filter(x=>x.status==='ok').length;
-      const skip = data.filter(x=>x.status==='skipped').length;
-      const err = data.filter(x=>x.status==='error').length;
-      pill.textContent = `Ingestion: ok=${ok}, skipped=${skip}, errors=${err}`;
-      pill.className = 'pill ' + (err? 'err' : (ok? 'ok':'warn'));
-    } else {
-      pill.textContent = 'Ingestion: pending…';
-      pill.className = 'pill';
-    }
-  }catch(e){}
-}
-pollIngest();
-setInterval(pollIngest, 3000);
-</script>
-</body>
-</html>
-"""
-
-def create_app():
+def create_app() -> Flask:
     app = Flask(__name__)
+    # ensure data directory exists
     os.makedirs("data", exist_ok=True)
     engine, Session = init_db("sqlite:///data/app.db")
     Base.metadata.create_all(bind=engine)
 
-    app.config["INGEST_REPORT"] = None  # last run report
+    # store last ingest report in app config
+    app.config["INGEST_REPORT"] = None
 
-    # --- kick off ingestion immediately (in a thread to avoid blocking boot) ---
-    def _run_ingest():
+    def run_ingest():
+        # run ingestion in background
         with Session() as s:
             app.config["INGEST_REPORT"] = ingest_all(s, "data")
-    threading.Thread(target=_run_ingest, daemon=True).start()
 
-    # --- UI home ---
-    @app.get("/")
-    def home():
-        return render_template_string(INDEX_HTML)
+    # start ingest thread on startup
+    threading.Thread(target=run_ingest, daemon=True).start()
 
-    # --- APIs the UI calls ---
-    @app.get("/api/ingest_report")
-    def api_ingest_report():
-        return jsonify(app.config.get("INGEST_REPORT"))
-
-    @app.post("/api/reingest")
-    def api_reingest():
+    def compute_kpis() -> dict:
+        """Compute per‑account and consolidated KPIs from the database."""
         with Session() as s:
-            app.config["INGEST_REPORT"] = ingest_all(s, "data")
-            return jsonify(app.config["INGEST_REPORT"])
+            # compute latest valuations per account
+            rows = latest_valuations(s)
+            accounts = {}
+            all_flows = []
+            total_terminal = 0.0
+            max_date = None
+            for acc_id, d, v in rows:
+                # compute per account XIRR
+                flows = (
+                    s.query(CashFlowExternal)
+                    .filter(CashFlowExternal.account_id == acc_id)
+                    .all()
+                )
+                cf_list = [(f.date, f.amount) for f in flows]
+                cf_list.append((d, v))
+                irr = xirr(cf_list)
+                accounts[acc_id] = {
+                    "date": d,
+                    "value": v,
+                    "xirr": irr,
+                }
+                # accumulate for consolidated XIRR
+                all_flows.extend(cf_list[:-1])
+                total_terminal += v
+                if max_date is None or d > max_date:
+                    max_date = d
+            cons_irr = None
+            if max_date is not None:
+                all_flows.append((max_date, total_terminal))
+                cons_irr = xirr(all_flows)
+            return {
+                "accounts": accounts,
+                "consolidated_nav": float(sum(a["value"] for a in accounts.values())),
+                "consolidated_irr": cons_irr,
+            }
 
-    @app.get("/api/parsed_main")
-    def parsed_main():
-        # parse headline numbers straight from PDFs, no DB
+    def parse_summaries() -> list[dict]:
+        """Return a list of headline numbers for each PDF in data/.
+
+        Uses the extractors' summary method. Does not interact with the
+        database, so it reflects the raw contents of the PDFs.
+        """
         out = []
         for fn in sorted(os.listdir("data")):
             if not fn.lower().endswith(".pdf"):
@@ -136,34 +99,95 @@ def create_app():
                 continue
             sm = ex.summary(path)
             out.append({"file": fn, "broker": ex.name, "headline": sm})
-        return jsonify(out)
+        return out
 
-    @app.get("/api/dashboard")
-    def api_dashboard():
-        with Session() as s:
-            nav = consolidated_nav(s)
-            return {"consolidated_nav": nav}
+    @app.route("/")
+    def index():
+        # compute metrics for display
+        status = app.config.get("INGEST_REPORT")
+        kpis = compute_kpis()
+        summaries = parse_summaries()
+        # format HTML tables
+        def fmt_irr(x):
+            return f"{x*100:.2f}%" if x is not None else "-"
 
-    @app.get("/api/kpi")
+        account_rows = "".join(
+            f"<tr><td>{acc_id}</td><td>{v['date']}</td><td>{v['value']:.2f}</td><td>{fmt_irr(v['xirr'])}</td></tr>"
+            for acc_id, v in kpis["accounts"].items()
+        )
+        summary_rows = "".join(
+            f"<tr><td>{item.get('file')}</td><td>{item.get('broker','-')}</td><td>{item.get('headline')}</td><td>{item.get('status','ok')}</td></tr>"
+            for item in summaries
+        )
+        ingest_msg = "Ingestion running…" if status is None else "Ingestion complete."
+        html = f"""
+        <html>
+        <head>
+          <meta charset='utf-8'>
+          <title>Portfolio Report</title>
+          <style>
+            body {{ font-family: Arial, sans-serif; margin: 20px; }}
+            h1, h2 {{ margin-bottom: 10px; }}
+            table {{ border-collapse: collapse; width: 100%; margin-bottom: 20px; }}
+            th, td {{ border: 1px solid #ccc; padding: 6px 8px; }}
+            th {{ background: #f0f0f0; text-align: left; }}
+            .small {{ color: #666; font-size: 0.9em; }}
+          </style>
+        </head>
+        <body>
+          <h1>Portfolio Report</h1>
+          <p class='small'>{ingest_msg}</p>
+
+          <h2>Headline Numbers (raw PDF parsing)</h2>
+          <table>
+            <tr><th>File</th><th>Broker</th><th>Headline</th><th>Status</th></tr>
+            {summary_rows}
+          </table>
+
+          <h2>Account Metrics</h2>
+          <table>
+            <tr><th>Account ID</th><th>Date</th><th>Total Value (USD)</th><th>IRR</th></tr>
+            {account_rows if account_rows else '<tr><td colspan="4">No accounts yet.</td></tr>'}
+          </table>
+
+          <h2>Consolidated</h2>
+          <p>Total NAV: {kpis['consolidated_nav']:.2f}</p>
+          <p>Consolidated IRR: {fmt_irr(kpis['consolidated_irr'])}</p>
+
+          <form action='{url_for('reingest')}' method='post'>
+            <button type='submit'>Re-scan data folder</button>
+          </form>
+        </body>
+        </html>
+        """
+        return html
+
+    @app.route("/reingest", methods=["POST"])
+    def reingest():
+        # start ingestion again in background
+        def run():
+            with Session() as s:
+                app.config["INGEST_REPORT"] = ingest_all(s, "data")
+        threading.Thread(target=run, daemon=True).start()
+        return redirect(url_for("index"))
+
+    @app.route("/api/kpi")
     def api_kpi():
-        with Session() as s:
-            lv = latest_valuations(s)
-            result, all_flows, total_terminal, max_date = {"accounts": {}, "consolidated": None}, [], 0.0, None
-            for account_id, d, v in lv:
-                if max_date is None or d > max_date: max_date = d
-                flows = s.query(CashFlowExternal).filter(CashFlowExternal.account_id == account_id).all()
-                cf = [(f.date, f.amount) for f in flows]
-                cf.append((d, v))
-                result["accounts"][account_id] = {"date": str(d), "value": v, "xirr": xirr(cf)}
-                all_flows.extend(cf[:-1]); total_terminal += v
-            if max_date is not None:
-                all_flows.append((max_date, total_terminal))
-                result["consolidated"] = xirr(all_flows)
-            return jsonify(result)
+        return jsonify(compute_kpis())
+
+    @app.route("/api/ingest_report")
+    def api_ingest_report():
+        return jsonify(app.config.get("INGEST_REPORT"))
+
+    @app.route("/api/parsed_main")
+    def api_parsed_main():
+        return jsonify(parse_summaries())
 
     return app
+
 
 app = create_app()
 
 if __name__ == "__main__":
+    # run the development server
     app.run(debug=True)
