@@ -1,0 +1,11 @@
+Flask>=3.0.2
+pandas>=2.2.0
+numpy>=1.26.0
+SQLAlchemy>=2.0.25
+pdfplumber>=0.11.0
+python-dateutil>=2.9.0
+yfinance>=0.2.40
+plotly>=5.22.0
+matplotlib>=3.8.0
+seaborn>=0.13.0
+PyYAML>=6.0.1
