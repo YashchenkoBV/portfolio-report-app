@@ -1,5 +1,9 @@
+from datetime import date, datetime
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
-from sqlalchemy import Integer, String, Float, Date, DateTime, ForeignKey, Text, UniqueConstraint
+from sqlalchemy import (
+    Integer, String, Float, ForeignKey, Text, UniqueConstraint,
+    Date as SA_Date, DateTime as SA_DateTime
+)
 
 class Base(DeclarativeBase):
     pass
@@ -14,7 +18,7 @@ class SourceFile(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     broker_id: Mapped[int] = mapped_column(ForeignKey("brokers.id"))
     path: Mapped[str] = mapped_column(Text)
-    asof_date: Mapped[Date | None]
+    asof_date: Mapped[date | None] = mapped_column(SA_Date, nullable=True)
     broker = relationship("Broker")
 
 class Account(Base):
@@ -39,7 +43,7 @@ class Instrument(Base):
 class PositionSnapshot(Base):
     __tablename__ = "position_snapshots"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    date: Mapped[Date]
+    date: Mapped[date] = mapped_column(SA_Date)
     account_id: Mapped[int] = mapped_column(ForeignKey("accounts.id"))
     instrument_id: Mapped[int] = mapped_column(ForeignKey("instruments.id"))
     quantity: Mapped[float] = mapped_column(Float)
@@ -55,7 +59,7 @@ class PositionSnapshot(Base):
 class Transaction(Base):
     __tablename__ = "transactions"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    datetime: Mapped[DateTime]
+    datetime: Mapped[datetime] = mapped_column(SA_DateTime)
     account_id: Mapped[int] = mapped_column(ForeignKey("accounts.id"))
     instrument_id: Mapped[int | None] = mapped_column(ForeignKey("instruments.id"), nullable=True)
     type: Mapped[str] = mapped_column(String)  # BUY/SELL/DIV/COUPON/TAX/FEE/TRANSFER_IN/TRANSFER_OUT
@@ -70,7 +74,7 @@ class Transaction(Base):
 class CashFlowExternal(Base):
     __tablename__ = "cashflows_external"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    date: Mapped[Date]
+    date: Mapped[date] = mapped_column(SA_Date)
     account_id: Mapped[int] = mapped_column(ForeignKey("accounts.id"))
     amount: Mapped[float] = mapped_column(Float)  # investor perspective: contributions negative, withdrawals positive
     currency: Mapped[str] = mapped_column(String, default="USD")
@@ -79,7 +83,7 @@ class CashFlowExternal(Base):
 class Valuation(Base):
     __tablename__ = "valuations"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    date: Mapped[Date]
+    date: Mapped[date] = mapped_column(SA_Date)
     account_id: Mapped[int] = mapped_column(ForeignKey("accounts.id"))
     total_value: Mapped[float] = mapped_column(Float)
     method: Mapped[str | None] = mapped_column(String, nullable=True)  # 'reported' or 'reconstructed'

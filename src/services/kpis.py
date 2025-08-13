@@ -1,7 +1,6 @@
 from __future__ import annotations
 from datetime import date, datetime
 from typing import Iterable, Tuple, List
-import math
 
 def _yearfrac(d0: date, d1: date) -> float:
     return (d1 - d0).days / 365.2425
@@ -17,10 +16,9 @@ def xirr(cashflows: Iterable[Tuple[date, float]], guess: float = 0.1) -> float |
     cfs = list(cashflows)
     if not cfs or all(abs(a) < 1e-12 for _, a in cfs):
         return None
-    # Newton with fallback bisection
     r = guess
+    # Newton with finite-diff derivative; fallback to bisection
     for _ in range(50):
-        # derivative via finite difference
         f = xnpv(r, cfs)
         if abs(f) < 1e-8:
             return r
@@ -29,8 +27,7 @@ def xirr(cashflows: Iterable[Tuple[date, float]], guess: float = 0.1) -> float |
             break
         r -= f / df
         if r <= -0.9999:
-            r = -0.9999 + 1e-6
-    # bisection in [-0.9999, 10]
+            r = -0.9998
     lo, hi = -0.9999, 10.0
     flo, fhi = xnpv(lo, cfs), xnpv(hi, cfs)
     if flo * fhi > 0:
@@ -58,21 +55,22 @@ def nav_bridge(start_nav: float, end_nav: float, contributions: float, withdrawa
         "end_nav": end_nav,
     }
 
-def time_weighted_return(points: List[Tuple[date, float]], flows: List[Tuple[date, float]] ) -> float | None:
-    # Simple TWR across flow breakpoints; flows are external cash flows (investor perspective).
-    if not points:
+def time_weighted_return(
+    points: List[Tuple[date, float]],
+    flows: List[Tuple[date, float]],
+) -> float | None:
+    # External flows are investor perspective: contributions negative, withdrawals positive.
+    if not points or len(points) < 2:
         return None
     points = sorted(points, key=lambda x: x[0])
     flows = sorted(flows, key=lambda x: x[0])
-    i = 0
-    twr = 1.0
+    twr_factor = 1.0
     v0_date, v0 = points[0]
     for v1_date, v1 in points[1:]:
-        # sum flows between (v0_date, v1_date]
         f = sum(a for d, a in flows if v0_date < d <= v1_date)
         if v0 == 0:
             return None
-        r = (v1 - f) / v0
-        twr *= r
+        subperiod_gross = (v1 - f) / v0  # equals (1 + r_k)
+        twr_factor *= subperiod_gross
         v0_date, v0 = v1_date, v1
-    return twr - 1.0
+    return twr_factor - 1.0
