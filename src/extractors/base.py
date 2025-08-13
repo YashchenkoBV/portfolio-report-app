@@ -9,3 +9,6 @@ class BaseExtractor(ABC):
 
     @abstractmethod
     def parse(self, session: Session, path: str): ...
+
+    @abstractmethod
+    def summary(self, path: str) -> dict: ...
