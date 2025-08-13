@@ -1,22 +1,5 @@
-"""Flask application entry point for the portfolio report app.
-
-This application automatically scans the ``data`` directory for PDF files
-on startup, parses them using the available extractors, stores the
-results in a SQLite database and computes simple portfolio metrics. The
-home page displays a summary of the ingestion status and the computed
-metrics. A ``/reingest`` route is available to re‑scan the data folder
-manually.
-
-The UI is deliberately minimal: no file upload, only the data in the
-``data`` directory is considered. If no PDFs are present or parsing
-fails, the metrics tables will be empty.
-"""
-
 from __future__ import annotations
-
 import os
-import threading
-from datetime import datetime
 from flask import Flask, jsonify, render_template_string, redirect, url_for
 from .db import init_db
 from .models import Base, CashFlowExternal
@@ -24,170 +7,151 @@ from .services.ingest import ingest_all, detect_extractor
 from .services.holdings import consolidated_nav, latest_valuations
 from .services.kpis import xirr
 
+def _safe_parse_summaries(data_dir: str = "data"):
+    out = []
+    for fn in sorted(os.listdir(data_dir)):
+        if not fn.lower().endswith(".pdf"):
+            continue
+        path = os.path.join(data_dir, fn)
+        ex = detect_extractor(path)
+        if not ex:
+            out.append({"file": fn, "status": "skipped", "reason": "no match"})
+            continue
+        try:
+            sm = ex.summary(path)  # side-effect free
+            out.append({"file": fn, "status": "ok", "broker": ex.name, "summary": sm})
+        except Exception as e:
+            out.append({"file": fn, "status": "error", "error": str(e)})
+    return out
 
 def create_app() -> Flask:
     app = Flask(__name__)
-    # ensure data directory exists
     os.makedirs("data", exist_ok=True)
     engine, Session = init_db("sqlite:///data/app.db")
     Base.metadata.create_all(bind=engine)
 
-    # store last ingest report in app config
-    app.config["INGEST_REPORT"] = None
+    # Ingest once, synchronously, so the page has data immediately
+    with Session() as s:
+        app.config["INGEST_REPORT"] = ingest_all(s, "data")
 
-    def run_ingest():
-        # run ingestion in background
+    @app.get("/")
+    def index():
+        summaries = _safe_parse_summaries("data")
+
+        # KPIs from DB
         with Session() as s:
-            app.config["INGEST_REPORT"] = ingest_all(s, "data")
-
-    # start ingest thread on startup
-    threading.Thread(target=run_ingest, daemon=True).start()
-
-    def compute_kpis() -> dict:
-        """Compute per‑account and consolidated KPIs from the database."""
-        with Session() as s:
-            # compute latest valuations per account
-            rows = latest_valuations(s)
-            accounts = {}
-            all_flows = []
-            total_terminal = 0.0
-            max_date = None
-            for acc_id, d, v in rows:
-                # compute per account XIRR
-                flows = (
-                    s.query(CashFlowExternal)
-                    .filter(CashFlowExternal.account_id == acc_id)
-                    .all()
-                )
-                cf_list = [(f.date, f.amount) for f in flows]
-                cf_list.append((d, v))
-                irr = xirr(cf_list)
-                accounts[acc_id] = {
-                    "date": d,
-                    "value": v,
-                    "xirr": irr,
-                }
-                # accumulate for consolidated XIRR
-                all_flows.extend(cf_list[:-1])
-                total_terminal += v
+            lv = latest_valuations(s)
+            accounts, all_flows, total_terminal, max_date = [], [], 0.0, None
+            for account_id, d, v in lv:
                 if max_date is None or d > max_date:
                     max_date = d
-            cons_irr = None
+                flows = s.query(CashFlowExternal).filter(
+                    CashFlowExternal.account_id == account_id
+                ).all()
+                cf = [(f.date, f.amount) for f in flows] + [(d, v)]
+                accounts.append({"id": account_id, "date": str(d), "value": v, "xirr": xirr(cf)})
+                all_flows.extend(cf[:-1])
+                total_terminal += v
+            consolidated_irr = None
             if max_date is not None:
                 all_flows.append((max_date, total_terminal))
-                cons_irr = xirr(all_flows)
-            return {
-                "accounts": accounts,
-                "consolidated_nav": float(sum(a["value"] for a in accounts.values())),
-                "consolidated_irr": cons_irr,
-            }
+                consolidated_irr = xirr(all_flows)
 
-    def parse_summaries() -> list[dict]:
-        """Return a list of headline numbers for each PDF in data/.
+        rep = app.config.get("INGEST_REPORT") or []
+        ok = sum(1 for r in rep if r.get("status") == "ok")
+        skip = sum(1 for r in rep if r.get("status") == "skipped")
+        err = sum(1 for r in rep if r.get("status") == "error")
+        ingest_label = f"ok={ok}, skipped={skip}, errors={err}" if rep else "no files found"
 
-        Uses the extractors' summary method. Does not interact with the
-        database, so it reflects the raw contents of the PDFs.
+        html = """
+        <html><head><meta charset="utf-8" />
+        <title>Portfolio</title>
+        <style>
+          body{font-family:system-ui, -apple-system, Segoe UI, Roboto, Arial; margin:24px}
+          table{border-collapse:collapse; width:100%} th,td{border:1px solid #ddd;padding:6px 8px;text-align:left; vertical-align: top}
+          .err{color:#b00} .pill{padding:6px 10px;border:1px solid #eee;border-radius:999px;background:#fafafa;margin-bottom:12px;display:inline-block}
+          button{padding:8px 12px;border:1px solid #ccc;border-radius:8px;background:#fff;cursor:pointer}
+          h2{margin:12px 0}
+        </style></head><body>
+        <h2>Headlines parsed from data/</h2>
+        <div class="pill">Last ingest: {{ ingest_label }}</div>
+
+        <table>
+          <tr><th>File</th><th>Status</th><th>Broker</th><th>As-of / Period</th><th>Total / NAV</th><th>Error</th></tr>
+          {% for r in summaries %}
+            <tr>
+              <td>{{ r.file }}</td>
+              <td>{{ r.status }}</td>
+              <td>{{ r.get('broker','') }}</td>
+              <td>
+                {% if r.status == 'ok' %}
+                  {% set sm = r.summary %}
+                  {% if sm.get('asof') %}{{ sm.get('asof') }}
+                  {% elif sm.get('period_start') %}{{ sm.get('period_start') }} → {{ sm.get('period_end') }}
+                  {% else %}–{% endif %}
+                {% endif %}
+              </td>
+              <td>
+                {% if r.status == 'ok' %}
+                  {% set sm = r.summary %}
+                  {% set cv = sm.get('current_value') %}
+                  {% set tp = sm.get('total_portfolio') %}
+                  {% set en = sm.get('end_nav_usd') %}
+                  {% if cv is not none %}{{ "%.2f"|format(cv) }}
+                  {% elif tp is not none %}{{ "%.2f"|format(tp) }}
+                  {% elif en is not none %}{{ "%.2f"|format(en) }}
+                  {% else %}–{% endif %}
+                {% endif %}
+              </td>
+              <td class="err">{{ r.get('error','') }}</td>
+            </tr>
+          {% endfor %}
+        </table>
+
+        <h2>Accounts (from DB)</h2>
+        <table>
+          <tr><th>Account ID</th><th>As of</th><th>Value</th><th>XIRR</th></tr>
+          {% for a in accounts %}
+            <tr>
+              <td>{{ a.id }}</td>
+              <td>{{ a.date }}</td>
+              <td>{{ "%.2f"|format(a.value) }}</td>
+              <td>{% if a.xirr is not none %}{{ (a.xirr*100)|round(2) }}%{% else %}–{% endif %}</td>
+            </tr>
+          {% endfor %}
+        </table>
+
+        <p style="margin-top:12px"><b>Consolidated NAV:</b> {{ "%.2f"|format(accounts|sum(attribute='value')) }}</p>
+        <p><b>Consolidated IRR:</b> {% if consolidated_irr is not none %}{{ (consolidated_irr*100)|round(2) }}%{% else %}–{% endif %}</p>
+
+        <form action="/reingest" method="post" style="margin-top:16px"><button>Re-scan data/</button></form>
+        </body></html>
         """
-        out = []
-        for fn in sorted(os.listdir("data")):
-            if not fn.lower().endswith(".pdf"):
-                continue
-            path = os.path.join("data", fn)
-            ex = detect_extractor(path)
-            if not ex:
-                out.append({"file": fn, "status": "skipped", "reason": "no match"})
-                continue
-            sm = ex.summary(path)
-            out.append({"file": fn, "broker": ex.name, "headline": sm})
-        return out
-
-    @app.route("/")
-    def index():
-        # compute metrics for display
-        status = app.config.get("INGEST_REPORT")
-        kpis = compute_kpis()
-        summaries = parse_summaries()
-        # format HTML tables
-        def fmt_irr(x):
-            return f"{x*100:.2f}%" if x is not None else "-"
-
-        account_rows = "".join(
-            f"<tr><td>{acc_id}</td><td>{v['date']}</td><td>{v['value']:.2f}</td><td>{fmt_irr(v['xirr'])}</td></tr>"
-            for acc_id, v in kpis["accounts"].items()
+        return render_template_string(html,
+            summaries=summaries,
+            accounts=accounts,
+            consolidated_irr=consolidated_irr,
+            ingest_label=ingest_label
         )
-        summary_rows = "".join(
-            f"<tr><td>{item.get('file')}</td><td>{item.get('broker','-')}</td><td>{item.get('headline')}</td><td>{item.get('status','ok')}</td></tr>"
-            for item in summaries
-        )
-        ingest_msg = "Ingestion running…" if status is None else "Ingestion complete."
-        html = f"""
-        <html>
-        <head>
-          <meta charset='utf-8'>
-          <title>Portfolio Report</title>
-          <style>
-            body {{ font-family: Arial, sans-serif; margin: 20px; }}
-            h1, h2 {{ margin-bottom: 10px; }}
-            table {{ border-collapse: collapse; width: 100%; margin-bottom: 20px; }}
-            th, td {{ border: 1px solid #ccc; padding: 6px 8px; }}
-            th {{ background: #f0f0f0; text-align: left; }}
-            .small {{ color: #666; font-size: 0.9em; }}
-          </style>
-        </head>
-        <body>
-          <h1>Portfolio Report</h1>
-          <p class='small'>{ingest_msg}</p>
 
-          <h2>Headline Numbers (raw PDF parsing)</h2>
-          <table>
-            <tr><th>File</th><th>Broker</th><th>Headline</th><th>Status</th></tr>
-            {summary_rows}
-          </table>
-
-          <h2>Account Metrics</h2>
-          <table>
-            <tr><th>Account ID</th><th>Date</th><th>Total Value (USD)</th><th>IRR</th></tr>
-            {account_rows if account_rows else '<tr><td colspan="4">No accounts yet.</td></tr>'}
-          </table>
-
-          <h2>Consolidated</h2>
-          <p>Total NAV: {kpis['consolidated_nav']:.2f}</p>
-          <p>Consolidated IRR: {fmt_irr(kpis['consolidated_irr'])}</p>
-
-          <form action='{url_for('reingest')}' method='post'>
-            <button type='submit'>Re-scan data folder</button>
-          </form>
-        </body>
-        </html>
-        """
-        return html
-
-    @app.route("/reingest", methods=["POST"])
+    @app.post("/reingest")
     def reingest():
-        # start ingestion again in background
-        def run():
-            with Session() as s:
-                app.config["INGEST_REPORT"] = ingest_all(s, "data")
-        threading.Thread(target=run, daemon=True).start()
+        # Re-run parsing, refresh page
+        with Session() as s:
+            app.config["INGEST_REPORT"] = ingest_all(s, "data")
         return redirect(url_for("index"))
 
-    @app.route("/api/kpi")
-    def api_kpi():
-        return jsonify(compute_kpis())
+    # Dev JSON routes (optional)
+    @app.get("/api/parsed_main")
+    def api_parsed_main():
+        return jsonify(_safe_parse_summaries("data"))
 
-    @app.route("/api/ingest_report")
+    @app.get("/api/ingest_report")
     def api_ingest_report():
         return jsonify(app.config.get("INGEST_REPORT"))
 
-    @app.route("/api/parsed_main")
-    def api_parsed_main():
-        return jsonify(parse_summaries())
-
     return app
 
-
 app = create_app()
-
 if __name__ == "__main__":
-    # run the development server
     app.run(debug=True)

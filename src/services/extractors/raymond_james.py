@@ -1,86 +1,54 @@
-"""Extractor for Raymond James portfolio PDFs.
-
-This extractor recognises Raymond James client access statements. It
-extracts the statement date ("As of" line) and the current value of the
-portfolio. The as‑of date uses the US month/day/year format.
-
-Currently individual positions are not parsed. That could be added by
-extracting the holdings table from the document.
-"""
-
+# src/services/extractors/raymond_james.py
 from __future__ import annotations
-
 import re
 from datetime import datetime
 from sqlalchemy.orm import Session
-from .base import BaseExtractor
-from ..bootstrap import (
-    bootstrap_broker,
-    get_or_create_account,
-    parse_money_to_float,
-)
 from ...models import SourceFile, Valuation
-from ...utils.pdf import read_text_all
+from ...utils.pdf import read_text
+from ...services.bootstrap import bootstrap_broker, get_or_create_account, parse_money_to_float
+from .base import BaseExtractor
 
+ASOF_RX = re.compile(r"\bAs\s*of\s*(\d{1,2}/\d{1,2}/\d{4})", re.IGNORECASE)
+CURVAL_RX = re.compile(r"\bCurrent\s*Value\b.*?([-$]?\$?\s?\d[\d,\s]*\.?\d*)", re.IGNORECASE | re.DOTALL)
 
 class RaymondJamesExtractor(BaseExtractor):
     name = "Raymond James"
 
     def detect(self, lower_text: str) -> bool:
-        return (
-            "raymond james" in lower_text
-            and "portfolio" in lower_text
-        ) or ("current value" in lower_text)
+        return ("raymond james | client access | my accounts | portfolio" in lower_text) or ("current value" in lower_text)
 
     def _extract_asof(self, text: str):
-        for line in text.splitlines():
-            if "as of" in line.lower():
-                # Expect format "As of 07/23/2025"
-                dt = line.split("as of", 1)[1].strip().split()[0]
-                try:
-                    return datetime.strptime(dt, "%m/%d/%Y").date()
-                except Exception:
-                    return None
-        return None
+        m = ASOF_RX.search(text)
+        if not m:
+            return None
+        try:
+            return datetime.strptime(m.group(1), "%m/%d/%Y").date()
+        except ValueError:
+            return None
 
     def _extract_total(self, text: str):
+        # line-by-line first
         for line in text.splitlines():
             if "current value" in line.lower():
-                val = parse_money_to_float(line)
-                if val is not None:
-                    return val
-        return None
+                v = parse_money_to_float(line)
+                if v is not None:
+                    return v
+        # wrapped layout
+        m = CURVAL_RX.search(text)
+        return parse_money_to_float(m.group(0)) if m else None
 
     def summary(self, path: str) -> dict:
-        text = read_text_all(path)
-        asof = self._extract_asof(text)
-        total = self._extract_total(text)
-        return {
-            "broker": self.name,
-            "asof": str(asof) if asof else None,
-            "current_value": total,
-        }
+        t = read_text(path, max_pages=4)
+        asof = self._extract_asof(t)
+        return {"broker": self.name, "asof": str(asof) if asof else None, "current_value": self._extract_total(t)}
 
     def parse(self, session: Session, path: str):
-        text = read_text_all(path)
-        asof = self._extract_asof(text)
-        total = self._extract_total(text)
-
         broker = bootstrap_broker(session, self.name)
         acc = get_or_create_account(session, broker.id, "RJ Consolidated", "USD")
-        # record source file
-        sf = SourceFile(broker_id=broker.id, path=path, asof_date=asof)
-        session.add(sf)
+        sm = self.summary(path)
+        session.add(SourceFile(broker_id=broker.id, path=path, asof_date=None if sm["asof"] is None else datetime.strptime(sm["asof"], "%Y-%m-%d").date()))
         session.commit()
-        # record valuation
-        if total is not None:
-            session.add(
-                Valuation(
-                    date=asof or datetime.today().date(),
-                    account_id=acc.id,
-                    total_value=total,
-                    method="reported",
-                )
-            )
-            session.commit()
-        return self.summary(path)
+        if sm["current_value"] is not None:
+            asof = datetime.strptime(sm["asof"], "%Y-%m-%d").date() if sm["asof"] else datetime.today().date()
+            session.add(Valuation(date=asof, account_id=acc.id, total_value=sm["current_value"], method="reported")); session.commit()
+        return sm

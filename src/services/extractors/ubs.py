@@ -1,95 +1,47 @@
-"""Extractor for UBS portfolio PDFs.
-
-This extractor recognises UBS portfolio statements by looking for common
-headings such as "Portfolio Holdings" or "Executive Summary". It
-extracts the report as‑of date and the total portfolio value. During
-parsing, it persists a ``SourceFile`` record and a ``Valuation`` record
-for the consolidated account.
-
-Currently this extractor does not parse individual positions. Those could
-be added later by reading the "Portfolio Holdings" table.
-"""
-
+# src/services/extractors/ubs.py
 from __future__ import annotations
-
 import re
 from datetime import datetime
 from sqlalchemy.orm import Session
-from .base import BaseExtractor
-from ..bootstrap import (
-    bootstrap_broker,
-    get_or_create_account,
-    parse_date_en,
-    parse_money_to_float,
-)
 from ...models import SourceFile, Valuation
-from ...utils.pdf import read_text_all
+from ...utils.pdf import read_text
+from ...services.bootstrap import bootstrap_broker, get_or_create_account, parse_money_to_float, parse_date_en
+from .base import BaseExtractor
 
+ASOF_RX = re.compile(r"\bas of\s+([A-Za-z]{3,9}\s+\d{1,2}\s+\d{4})", re.IGNORECASE)
 
 class UBSExtractor(BaseExtractor):
     name = "UBS"
 
-    # regex for "as of May 27 2025" or similar
-    ASOF_RX = re.compile(r"as of\s+([A-Za-z]{3,9} \d{1,2} \d{4})", re.IGNORECASE)
-
     def detect(self, lower_text: str) -> bool:
-        keys = [
-            "portfolio holdings",
-            "equity summary",
-            "asset allocation by account",
-            "executive summary",
-            "ubs financial services",
-            "ubs fs",
-        ]
+        keys = ["portfolio holdings", "executive summary", "equity summary", "asset allocation by account", "ubs financial services", "ubs fs"]
         return any(k in lower_text for k in keys)
 
     def _extract_asof(self, text: str):
-        m = self.ASOF_RX.search(text)
-        if m:
-            return parse_date_en(m.group(1))
-        return None
+        m = ASOF_RX.search(text)
+        return parse_date_en(m.group(1)) if m else None
 
     def _extract_total(self, text: str):
         total = None
         for line in text.splitlines():
-            # look for "Total Portfolio" followed by a number
             if "total portfolio" in line.lower():
-                val = parse_money_to_float(line)
-                if val is not None:
-                    total = val
+                v = parse_money_to_float(line)
+                if v is not None:
+                    total = v
         return total
 
     def summary(self, path: str) -> dict:
-        text = read_text_all(path)
-        asof = self._extract_asof(text)
-        total = self._extract_total(text)
-        return {
-            "broker": self.name,
-            "asof": str(asof) if asof else None,
-            "total_portfolio": total,
-        }
+        t = read_text(path, max_pages=6)
+        asof = self._extract_asof(t)
+        return {"broker": self.name, "asof": str(asof) if asof else None, "total_portfolio": self._extract_total(t)}
 
     def parse(self, session: Session, path: str):
-        # Read whole PDF to extract numbers
-        text = read_text_all(path)
-        asof = self._extract_asof(text)
-        total = self._extract_total(text)
-
         broker = bootstrap_broker(session, self.name)
         acc = get_or_create_account(session, broker.id, "UBS Consolidated", "USD")
-        # record the source file; store asof if present
-        sf = SourceFile(broker_id=broker.id, path=path, asof_date=asof)
-        session.add(sf)
+        sm = self.summary(path)
+        session.add(SourceFile(broker_id=broker.id, path=path, asof_date=None if sm["asof"] is None else datetime.strptime(sm["asof"], "%Y-%m-%d").date()))
         session.commit()
-        # record valuation if a total was found
-        if total is not None:
-            session.add(
-                Valuation(
-                    date=asof or datetime.today().date(),
-                    account_id=acc.id,
-                    total_value=total,
-                    method="reported",
-                )
-            )
-            session.commit()
-        return self.summary(path)
+        if sm["total_portfolio"] is not None:
+            asof = datetime.strptime(sm["asof"], "%Y-%m-%d").date() if sm["asof"] else datetime.today().date()
+            session.add(Valuation(date=asof, account_id=acc.id, total_value=sm["total_portfolio"], method="reported")); session.commit()
+        return sm
