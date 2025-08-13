@@ -20,6 +20,7 @@ class SourceFile(Base):
     path: Mapped[str] = mapped_column(Text)
     asof_date: Mapped[date | None] = mapped_column(SA_Date, nullable=True)
     broker = relationship("Broker")
+    __table_args__ = (UniqueConstraint("path", name="uq_sourcefile_path"),)
 
 class Account(Base):
     __tablename__ = "accounts"
@@ -76,7 +77,7 @@ class CashFlowExternal(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     date: Mapped[date] = mapped_column(SA_Date)
     account_id: Mapped[int] = mapped_column(ForeignKey("accounts.id"))
-    amount: Mapped[float] = mapped_column(Float)  # investor perspective: contributions negative, withdrawals positive
+    amount: Mapped[float] = mapped_column(Float)  # contributions negative, withdrawals positive
     currency: Mapped[str] = mapped_column(String, default="USD")
     note: Mapped[str | None] = mapped_column(Text, nullable=True)
 
